@@ -1,0 +1,959 @@
+--// ===== Services =====
+local Players = game:GetService("Players")
+local HttpService = game:GetService("HttpService")
+local TeleportService = game:GetService("TeleportService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+local LocalPlayer = Players.LocalPlayer
+
+pcall(function()
+    game:GetService("GuiService"):SetErrorPromptEnabled(false)
+end)
+
+--// ===== Load Sugar UI =====
+local SugarLibrary = loadstring(game:HttpGetAsync('https://raw.githubusercontent.com/kirikanzu26/farm-vip-vd-zu/refs/heads/main/Source'))();
+local Notification = SugarLibrary.Notification();
+
+local Windows = SugarLibrary.new({
+    Title = "VD Auto Farm",
+    Description = "version: 1.0.0",
+    Keybind = Enum.KeyCode.RightShift,
+    Logo = 'http://www.roblox.com/asset/?id=106256231769307',
+    ConfigFolder = "VDAutoFarm"
+})
+
+--// ===== State =====
+local State = {
+    EnableAutoFarm = false,
+    ServerHop = false,
+    AutoExecute = false,
+    EnableWebhook = false,
+    WebhookLink = "",
+}
+local Unloaded = false
+
+--// ===== Tabs & Sections =====
+local AutoFarmTab = Windows:NewTab({ Title = "Auto Farm", Description = "Auto farm & server hop", Icon = "zap" })
+local SettingsTab = Windows:NewTab({ Title = "Settings", Description = "Config management", Icon = "settings" })
+
+local AutoFarmGroup = AutoFarmTab:NewSection({ Title = "Auto Farm", Icon = "zap", Position = "Left" })
+local WebhookGroup  = AutoFarmTab:NewSection({ Title = "Webhook", Icon = "webhook", Position = "Right" })
+local ConfigSection = SettingsTab:NewSection({ Title = "Config list", Icon = "file-cog", Position = "Left" })
+
+--// ===== Helper =====
+local function Trim(s)
+    return (tostring(s or ""):gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+--// ===== Helper Notify =====
+local LastNotifTime = 0
+local function Notify(title, desc, duration)
+    local now = os.clock()
+    if now - LastNotifTime < 2.5 then return end
+    LastNotifTime = now
+    Notification.new({
+        Title = title,
+        Description = desc,
+        Duration = duration or 3,
+        Icon = "bell"
+    })
+end
+
+local function NotifyForce(title, desc, duration)
+    LastNotifTime = 0
+    Notification.new({
+        Title = title,
+        Description = desc,
+        Duration = duration or 5,
+        Icon = "bell"
+    })
+    LastNotifTime = os.clock()
+end
+
+--==================================================
+--= CORE LOGIC
+--==================================================
+
+local BeatState = {
+    LastFinishPos = nil,
+    BeatSurvivorDone = false,
+    LastRole = nil,
+}
+local FinishWatchActive = false
+local ForceServerHop = false
+local ServerHop
+
+local function GetRole()
+    local team = LocalPlayer.Team
+    if not team then return "Unknown" end
+    local n = team.Name
+    if n == "Killer" then return "Killer"
+    elseif n == "Survivors" then return "Survivor"
+    elseif n == "Spectator" or n == "Spectators" then return "Spectator" end
+    return "Lobby"
+end
+
+local function GetRoot()
+    local c = LocalPlayer.Character
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+local function SafeReq(opts)
+    local fn = (syn and syn.request) or (http and http.request) or http_request or request
+        or (fluxus and fluxus.request) or (krnl and krnl.request)
+    return fn and fn(opts)
+end
+
+local function ExecutorName()
+    return (identifyexecutor and identifyexecutor())
+        or (getexecutorname and getexecutorname())
+        or "Unknown Executor"
+end
+
+local ATTR_FILE = "VD_AutoFarm_Attributes.json"
+local PrevAttrs
+
+local function LoadSnapshot()
+    if not isfile or not readfile or not isfile(ATTR_FILE) then return nil end
+    local ok, data = pcall(function() return HttpService:JSONDecode(readfile(ATTR_FILE)) end)
+    if not ok or type(data) ~= "table" or tonumber(data.UserId) ~= LocalPlayer.UserId then return nil end
+    return {
+        KillerChance = tonumber(data.KillerChance),
+        EXP = tonumber(data.EXP),
+        Screws = tonumber(data.Screws),
+        Gears = tonumber(data.Gears),
+    }
+end
+
+local function SaveSnapshot(attrs)
+    if not writefile then return false end
+    local data = {
+        UserId = LocalPlayer.UserId,
+        KillerChance = attrs.KillerChance,
+        EXP = attrs.EXP,
+        Screws = attrs.Screws,
+        Gears = attrs.Gears,
+        UpdatedAt = os.time(),
+    }
+    return pcall(function() writefile(ATTR_FILE, HttpService:JSONEncode(data)) end)
+end
+
+local function Delta(cur, prev)
+    cur = tonumber(cur) or 0
+    if prev == nil then return 0 end
+    return cur - (tonumber(prev) or 0)
+end
+
+PrevAttrs = LoadSnapshot()
+
+--// ==== Webhook ====
+local webhookTextbox   -- forward declare, diisi setelah UI dibuat
+local webhookToggleRef -- forward declare
+
+local function WebhookEnabled()
+    return State.EnableWebhook
+end
+
+-- Baca URL fresh (dari textbox dulu, fallback ke State)
+local function GetWebhookUrl()
+    if webhookTextbox and type(webhookTextbox.Get) == "function" then
+        local ok, v = pcall(webhookTextbox.Get)
+        if ok and type(v) == "string" and Trim(v) ~= "" then
+            return Trim(v)
+        end
+    end
+    return Trim(State.WebhookLink)
+end
+
+local function WebhookUrl()
+    return GetWebhookUrl()
+end
+
+local function ValidWebhook(url)
+    url = Trim(url)
+    if url == "" then return false, "URL kosong (isi webhook dulu & tekan Enter)" end
+    if #url < 30 then return false, "URL terlalu pendek (" .. #url .. " karakter)" end
+    if not (url:find("discord%.com/api/webhooks/") or url:find("discordapp%.com/api/webhooks/")) then
+        return false, "Format harus: https://discord.com/api/webhooks/..."
+    end
+    return true
+end
+
+local function SendDebug(title, desc)
+    if not WebhookEnabled() then return false end
+    local url = WebhookUrl()
+    local ok = ValidWebhook(url)
+    if not ok then return false end
+    local payload = {
+        embeds = {{
+            title = title, description = desc, color = 16711680,
+            footer = { text = "ServerHop Debug" },
+            timestamp = os.date("!%Y-%m-%dT%H:%M:%S.000Z"),
+        }},
+    }
+    local res = SafeReq({
+        Url = url, Method = "POST",
+        Headers = { ["Content-Type"] = "application/json" },
+        Body = HttpService:JSONEncode(payload),
+    })
+    return res and (res.StatusCode == 200 or res.StatusCode == 204)
+end
+
+local function SendWebhook(title, desc, force)
+    if not force and not WebhookEnabled() then
+        return false, "Webhook Disabled (nyalakan toggle Enable Webhook)"
+    end
+
+    local url = WebhookUrl()
+    local ok, reason = ValidWebhook(url)
+    if not ok then
+        return false, reason .. "\nURL: " .. (url == "" and "(kosong)" or url:sub(1, 60))
+    end
+
+    if not SafeReq then
+        return false, "Executor tidak support HTTP request"
+    end
+
+    local attrs = LocalPlayer:GetAttributes()
+    local kc = tonumber(attrs.KillerChance) or 0
+    local exp = tonumber(attrs.EXP) or 0
+    local screws = tonumber(attrs.Screws) or 0
+    local gears = tonumber(attrs.Gears) or 0
+    local lvl = tonumber(attrs.Level) or 0
+
+    if not PrevAttrs then
+        PrevAttrs = { KillerChance = kc, EXP = exp, Screws = screws, Gears = gears }
+    end
+
+    local payload = {
+        embeds = {{
+            title = title or string.format("%s · Level %d", LocalPlayer.DisplayName, lvl),
+            url = string.format("https://www.roblox.com/users/%d/profile", LocalPlayer.UserId),
+            description = desc, color = 3638942,
+            fields = {
+                { name = " SIN",    value = string.format("%s (**%+d**)", kc,     Delta(kc,     PrevAttrs.KillerChance)), inline = false },
+                { name = " EXP",    value = string.format("%s (**%+d**)", exp,    Delta(exp,    PrevAttrs.EXP)),          inline = false },
+                { name = " Screws", value = string.format("%s (**%+d**)", screws, Delta(screws, PrevAttrs.Screws)),       inline = false },
+                { name = " Gears",  value = string.format("%s (**%+d**)", gears,  Delta(gears,  PrevAttrs.Gears)),        inline = false },
+                { name = " Server ID", value = string.format("```\n%s\n```", game.JobId ~= "" and game.JobId or "Singleplayer"), inline = false },
+            },
+            footer = { text = string.format("VD Auto Farm · %s", ExecutorName()) },
+            timestamp = os.date("!%Y-%m-%dT%H:%M:%S.000Z"),
+        }},
+    }
+
+    local ok2, res = pcall(function()
+        return SafeReq({
+            Url = url, Method = "POST",
+            Headers = { ["Content-Type"] = "application/json" },
+            Body = HttpService:JSONEncode(payload),
+        })
+    end)
+
+    if not ok2 or not res then
+        return false, "HTTP request gagal (executor tidak support)"
+    end
+
+    if res.StatusCode == 200 or res.StatusCode == 204 then
+        PrevAttrs = { KillerChance = kc, EXP = exp, Screws = screws, Gears = gears }
+        SaveSnapshot(PrevAttrs)
+        return true, "OK"
+    end
+
+    -- Pesan error yang lebih jelas
+    local status = res.StatusCode or "No Response"
+    local hint = ""
+    if status == 401 or status == 404 then
+        hint = "  URL webhook salah / sudah dihapus"
+    elseif status == 429 then
+        hint = "  Rate limit, tunggu sebentar"
+    elseif status == 400 then
+        hint = "  Format JSON salah"
+    end
+    return false, string.format("HTTP %s%s", tostring(status), hint)
+end
+
+--// ==== FindFinish ====
+local function FindFinish(map)
+    local pos
+    pcall(function()
+        if map:FindFirstChild("RooftopHitbox") or map:FindFirstChild("Rooftop") then
+            pos = Vector3.new(3098.16, 454.04, -4918.74); return
+        end
+        if map:FindFirstChild("HooksMeat") then
+            pos = Vector3.new(1546.12, 152.21, -796.72); return
+        end
+        if map:FindFirstChild("churchbell") then
+            pos = Vector3.new(760.98, -20.14, -78.48); return
+        end
+        local finish = map:FindFirstChild("Finishline") or map:FindFirstChild("FinishLine") or map:FindFirstChild("Fininshline")
+        if finish then
+            if finish:IsA("BasePart") then pos = finish.Position
+            elseif finish:IsA("Model") then
+                local p = finish:FindFirstChildWhichIsA("BasePart")
+                if p then pos = p.Position end
+            end
+            return
+        end
+        for _, obj in ipairs(map:GetDescendants()) do
+            if obj.Name:lower():find("finish") then
+                if obj:IsA("BasePart") then pos = obj.Position; break
+                elseif obj:IsA("Model") then
+                    local p = obj:FindFirstChildWhichIsA("BasePart")
+                    if p then pos = p.Position; break end
+                end
+            end
+        end
+        if pos then return end
+        for _, obj in ipairs(map:GetDescendants()) do
+            if obj:IsA("MeshPart") and obj.Material == Enum.Material.Limestone then
+                pos = Vector3.new(-947.90, 152.12, -7579.52); break
+            end
+        end
+        if pos then return end
+        for _, obj in ipairs(map:GetDescendants()) do
+            if obj:IsA("MeshPart") and obj.Material == Enum.Material.Leather then
+                pos = Vector3.new(1546.12, 152.21, -796.72); break
+            end
+        end
+    end)
+    return pos
+end
+
+--// ==== BeatGame ====
+local function BeatGame()
+    if not State.EnableAutoFarm then
+        BeatState.BeatSurvivorDone = false
+        BeatState.LastFinishPos = nil
+        return
+    end
+
+    local role = GetRole()
+    if BeatState.LastRole ~= role then
+        if role == "Survivor" then Notify(" Survivor!", "Ready to farm.") end
+        BeatState.LastRole = role
+    end
+    if role ~= "Survivor" then return end
+
+    local root = GetRoot()
+    if not root then Notify(" Waiting", "Character not loaded"); return end
+
+    local map = Workspace:FindFirstChild("Map")
+    if not map then Notify(" No Map", "Waiting for map"); return end
+
+    local exitPos = FindFinish(map)
+    if not exitPos then Notify(" Finish Not Found", "Map unsupported"); return end
+
+    if BeatState.LastFinishPos and (exitPos - BeatState.LastFinishPos).Magnitude > 50 then
+        BeatState.BeatSurvivorDone = false
+    end
+    if BeatState.BeatSurvivorDone then return end
+
+    Notify(" Finish Found", "Waiting 6s...")
+    task.wait(6)
+
+    if not State.EnableAutoFarm then
+        Notify(" Cancelled", "Toggle turned off"); return
+    end
+    if GetRole() ~= "Survivor" then
+        Notify(" Cancelled", "Not Survivor anymore"); return
+    end
+
+    local currentRoot = GetRoot()
+    if not currentRoot then Notify(" Cancelled", "Character missing"); return end
+
+    Notify(" Teleporting", "Moving to finish...")
+    currentRoot.CFrame = CFrame.new(exitPos)
+    BeatState.BeatSurvivorDone = true
+    BeatState.LastFinishPos = exitPos
+    Notify(" Teleport Success", "Round completed!")
+
+    if not FinishWatchActive then
+        FinishWatchActive = true
+        task.spawn(function()
+            local start = os.clock()
+            local timeout = 10
+            while os.clock() - start < timeout do
+                if not State.EnableAutoFarm then FinishWatchActive = false; return end
+                if GetRole() == "Spectator" then
+                    FinishWatchActive = false
+                    Notify(" Match Completed", "Role changed to Spectator.")
+                    return
+                end
+                task.wait(0.5)
+            end
+            if GetRole() == "Survivor" then
+                Notify(" Match Stuck", "Still Survivor after finish. Server hopping...")
+                pcall(function()
+                    SendDebug(" Match Stuck", string.format("Role remained `%s` after %ds.\nServer: `%s`",
+                        tostring(GetRole()), timeout, tostring(game.JobId)))
+                end)
+                if State.ServerHop then ForceServerHop = true end
+            end
+            FinishWatchActive = false
+        end)
+    end
+    task.wait(5)
+    SendWebhook()
+end
+
+--// ==== Server Hop ====
+local IGNORE_FILE = "ServerHop.txt"
+local IGNORE_CANDIDATE = 180
+local IGNORE_FAILED = 600
+local API_RETRY = 3
+local PAGE_WAIT = 0.5
+local NO_SERVER_WAIT = 3
+local TELEPORT_TIMEOUT = 7
+local TELEPORT_RETRY_WAIT = 2.5
+
+local IgnoredServers = {}
+local TargetServer = nil
+local OriginalJob = nil
+local TeleportInProgress = false
+local TeleportFailed = false
+local IsHopping = false
+
+local function LoadIgnored()
+    if not isfile or not readfile or not isfile(IGNORE_FILE) then return {} end
+    local ok, content = pcall(readfile, IGNORE_FILE)
+    if not ok then return {} end
+    local now = os.time()
+    local list = {}
+    for _, line in ipairs(content:split("\n")) do
+        local id, exp = line:match("^([^|]+)|(%d+)$")
+        exp = tonumber(exp)
+        if id and id ~= "" and exp and now < exp then list[id] = exp end
+    end
+    return list
+end
+
+local function SaveIgnored(list)
+    if not writefile then return end
+    local now = os.time()
+    local lines = {}
+    for id, exp in pairs(list) do
+        if id and exp and now < exp then table.insert(lines, id .. "|" .. exp) end
+    end
+    pcall(function() writefile(IGNORE_FILE, table.concat(lines, "\n")) end)
+end
+
+local function AddIgnored(id, duration)
+    if not id then return end
+    IgnoredServers[id] = os.time() + duration
+    SaveIgnored(IgnoredServers)
+end
+
+local function IsIgnored(id)
+    local exp = IgnoredServers[id]
+    if not exp then return false end
+    if os.time() >= exp then IgnoredServers[id] = nil; SaveIgnored(IgnoredServers); return false end
+    return true
+end
+
+local IsRound = false
+local Remotes = ReplicatedStorage:WaitForChild("Remotes")
+local StatusEvent = Remotes:WaitForChild("StatusUpdateEvent")
+local TimeEvent = Remotes:WaitForChild("TimeUpdateEvent")
+
+StatusEvent.OnClientEvent:Connect(function(s)
+    if s == "WaitingForPlayers" or s == "IntermissionStarting" or s == "Intermission" then
+        IsRound = false
+        BeatState.BeatSurvivorDone = false
+    end
+end)
+TimeEvent.OnClientEvent:Connect(function(s)
+    if s == "Round" then IsRound = true end
+end)
+
+local function CanHop()
+    if not IsRound then return false end
+    local r = GetRole()
+    return r == "Spectator" or r == "Killer"
+end
+
+local function ResetTeleportState()
+    TargetServer = nil
+    OriginalJob = nil
+    TeleportInProgress = false
+    TeleportFailed = false
+end
+
+local function BeginTeleport(id)
+    TargetServer = id
+    OriginalJob = game.JobId
+    TeleportInProgress = true
+    TeleportFailed = false
+end
+
+TeleportService.TeleportInitFailed:Connect(function(player, result, err)
+    if player ~= LocalPlayer or not TeleportInProgress then return end
+    local id = TargetServer
+    TeleportFailed = true
+    if id then
+        AddIgnored(id, IGNORE_FAILED)
+        Notify(" Teleport Failed", string.format("Server %s blacklisted 10m", id:sub(1, 8)))
+        pcall(function()
+            SendDebug(" Teleport Failed", string.format("Server: `%s`\nCode: `%s`\nError: `%s`",
+                id, tostring(result), tostring(err)))
+        end)
+    end
+end)
+
+local function DoTeleport(id)
+    BeginTeleport(id)
+    local ok, err = pcall(function()
+        TeleportService:TeleportToPlaceInstance(game.PlaceId, id, LocalPlayer)
+    end)
+    if not ok then
+        TeleportInProgress = false
+        AddIgnored(id, IGNORE_FAILED)
+        Notify(" Teleport Error", "Call failed, retrying later")
+        pcall(function()
+            SendDebug(" Teleport Call Failed", string.format("Server: `%s`\nError: `%s`", id, tostring(err)))
+        end)
+        ResetTeleportState()
+        return false
+    end
+    return true
+end
+
+local function WaitTeleport()
+    local start = os.clock()
+    while TeleportInProgress and not TeleportFailed and os.clock() - start < TELEPORT_TIMEOUT do
+        if game.JobId ~= OriginalJob then return "Success" end
+        task.wait(0.1)
+    end
+    if TeleportFailed then return "Failed" end
+    if game.JobId ~= OriginalJob then return "Success" end
+    return "Timeout"
+end
+
+ServerHop = function()
+    if IsHopping then return end
+    IsHopping = true
+    IgnoredServers = LoadIgnored()
+    ResetTeleportState()
+
+    local cursor = ""
+    local apiFails = 0
+    while State.ServerHop and not Unloaded do
+        local forced = ForceServerHop
+        ForceServerHop = false
+
+        if not forced and not CanHop() then
+            ResetTeleportState()
+            task.wait(0.5)
+            continue
+        end
+
+        local url = string.format(
+            "https://games.roblox.com/v1/games/%s/servers/Public?limit=100&sortOrder=Asc&excludeFullGames=true&cursor=%s",
+            game.PlaceId, HttpService:UrlEncode(cursor))
+
+        local ok, res = pcall(function() return HttpService:JSONDecode(game:HttpGet(url)) end)
+        if not ok or not res or type(res.data) ~= "table" then
+            apiFails = apiFails + 1
+            if apiFails >= 5 then
+                cursor = ""
+                apiFails = 0
+                pcall(function() SendDebug("API Error", "Reset pagination after 5 failures") end)
+            end
+            task.wait(API_RETRY)
+            continue
+        end
+        apiFails = 0
+
+        local curJob = game.JobId
+        local found = false
+        for _, srv in ipairs(res.data) do
+            if not State.ServerHop or Unloaded then break end
+            if not forced and not CanHop() then break end
+            if srv.id and srv.id ~= curJob and srv.playing == 2 and not IsIgnored(srv.id) then
+                found = true
+                local id = srv.id
+                local count = srv.playing
+                AddIgnored(id, IGNORE_CANDIDATE)
+                Notify(" Teleporting", string.format("%d player | %s", count, id:sub(1, 8)))
+                task.wait(2)
+                if not DoTeleport(id) then
+                    task.wait(TELEPORT_RETRY_WAIT)
+                    continue
+                end
+                local result = WaitTeleport()
+                if result == "Success" then
+                    ResetTeleportState()
+                    IsHopping = false
+                    return
+                elseif result == "Failed" then
+                    ResetTeleportState()
+                    task.wait(TELEPORT_RETRY_WAIT)
+                    continue
+                else
+                    local failId = TargetServer
+                    if failId then
+                        AddIgnored(failId, IGNORE_FAILED)
+                        pcall(function()
+                            SendDebug(" Teleport Timeout", string.format("Server %s no response in %ds", failId, TELEPORT_TIMEOUT))
+                        end)
+                    end
+                    Notify(" Timeout", "Server didn't respond, trying next")
+                    ResetTeleportState()
+                    task.wait(TELEPORT_RETRY_WAIT)
+                end
+            end
+        end
+
+        if not found then
+            local nextCursor = res.nextPageCursor or ""
+            if nextCursor ~= "" then
+                cursor = nextCursor
+                task.wait(PAGE_WAIT)
+            else
+                cursor = ""
+                Notify(" Server Hop", "No 1-3 player server available")
+                task.wait(NO_SERVER_WAIT)
+            end
+        end
+    end
+    ResetTeleportState()
+    IsHopping = false
+end
+
+--// ==== Auto Execute ====
+local LOADER_URL = "https://raw.githubusercontent.com/Rzor731/VD-AUTO-FARM/refs/heads/main/loader.lua"
+local AutoExecuteQueued = false
+
+local function QueueAutoExec()
+    if AutoExecuteQueued or not State.AutoExecute then return end
+    if type(queue_on_teleport) ~= "function" then
+        Notify("Auto Execute", "queue_on_teleport not available", 5); return
+    end
+    local code = string.format([[loadstring(game:HttpGet(%q))()]], LOADER_URL)
+    local ok, err = pcall(function() queue_on_teleport(code) end)
+    if ok then
+        AutoExecuteQueued = true
+        Notify("Auto Execute", "Queued for next teleport")
+    else
+        Notify("Auto Execute", "Failed: " .. tostring(err), 5)
+    end
+end
+
+--==================================================
+--= UI: AUTO FARM TAB
+--==================================================
+
+local toggleRefs = {}
+
+toggleRefs.EnableAutoFarm = AutoFarmGroup:NewToggle({
+    Title = "Enable Auto Farm",
+    Name = "EnableAutoFarm",
+    Default = false,
+    Callback = function(v) State.EnableAutoFarm = v end,
+})
+
+toggleRefs.ServerHop = AutoFarmGroup:NewToggle({
+    Title = "Server Hop",
+    Name = "ServerHop",
+    Default = false,
+    Callback = function(v)
+        State.ServerHop = v
+        if v then task.spawn(ServerHop) end
+    end,
+})
+
+toggleRefs.AutoExecute = AutoFarmGroup:NewToggle({
+    Title = "Auto Execute",
+    Name = "AutoExecute",
+    Default = false,
+    Callback = function(v)
+        State.AutoExecute = v
+        if v then QueueAutoExec() else AutoExecuteQueued = false end
+    end,
+})
+
+toggleRefs.EnableWebhook = WebhookGroup:NewToggle({
+    Title = "Enable Webhook",
+    Name = "EnableWebhook",
+    Default = false,
+    Callback = function(v)
+        State.EnableWebhook = v
+        if v then
+            local url = WebhookUrl()
+            local ok, reason = ValidWebhook(url)
+            if not ok then
+                NotifyForce(" Webhook", reason, 6)
+            else
+                NotifyForce(" Webhook", "Siap digunakan", 3)
+            end
+        end
+    end,
+})
+
+webhookTextbox = WebhookGroup:NewTextbox({
+    Title = "Webhook Link",
+    Default = "",
+    FileType = "",
+    Callback = function(text)
+        State.WebhookLink = Trim(text)
+        print(string.format("[VD] Webhook saved (len=%d): %s", #State.WebhookLink, State.WebhookLink:sub(1, 80)))
+        if State.WebhookLink ~= "" then
+            local ok, reason = ValidWebhook(State.WebhookLink)
+            if ok then
+                NotifyForce(" Webhook", "URL valid, siap test", 3)
+            else
+                NotifyForce(" Webhook", reason, 5)
+            end
+        end
+    end,
+})
+
+WebhookGroup:NewButton({
+    Title = "Test Webhook",
+    Callback = function()
+        -- Reset cooldown notif biar error selalu muncul
+        LastNotifTime = 0
+
+        -- Ambil URL fresh dari textbox
+        local url = GetWebhookUrl()
+        print("[VD] Test Webhook - URL:", url)
+
+        if url == "" then
+            NotifyForce(" Webhook Failed", "URL kosong! Ketik URL di textbox lalu tekan ENTER dulu.", 8)
+            return
+        end
+
+        local ok, reason = ValidWebhook(url)
+        if not ok then
+            NotifyForce(" Webhook Failed", reason, 8)
+            return
+        end
+
+        local success, msg = SendWebhook(" Webhook Test", "Test from VD Auto Farm!", true)
+        if success then
+            NotifyForce(" Webhook Success", "Pesan terkirim ke Discord!", 4)
+        else
+            NotifyForce(" Webhook Failed", tostring(msg), 8)
+        end
+    end,
+})
+
+--==================================================
+--= UI: SETTINGS TAB — CONFIG LIST ONLY
+--==================================================
+
+local AUTOLOAD_FILE = "VD_AutoFarm_AutoLoad.txt"
+
+local function ReadAutoload()
+    if not isfile or not readfile or not isfile(AUTOLOAD_FILE) then return "" end
+    local ok, content = pcall(readfile, AUTOLOAD_FILE)
+    if not ok then return "" end
+    content = tostring(content):gsub("^%s+", ""):gsub("%s+$", "")
+    if content == "off" or content == "none" then return "" end
+    return content
+end
+
+local function WriteAutoload(name)
+    if not writefile then return end
+    pcall(function()
+        writefile(AUTOLOAD_FILE, (name and name ~= "") and name or "off")
+    end)
+end
+
+local function RefreshConfigList()
+    local list = Windows.ListConfigs() or {}
+    local out = {}
+    for _, c in ipairs(list) do table.insert(out, c) end
+    if #out == 0 then out = { "---" } end
+    return out
+end
+
+local configNames = RefreshConfigList()
+
+local configDropdown = ConfigSection:NewDropdown({
+    Title = "Configs",
+    Data = configNames,
+    Default = configNames[1],
+    Callback = function(a) end,
+})
+
+local configNameTextbox = ConfigSection:NewTextbox({
+    Title = "Config Name",
+    Default = "",
+    FileType = "",
+    Callback = function(name) end,
+})
+
+ConfigSection:NewButton({
+    Title = "Create Config",
+    Callback = function()
+        local newName = configNameTextbox.Get()
+        if newName and newName ~= "" then
+            Windows.SaveConfig(newName)
+            configNames = RefreshConfigList()
+            configDropdown.Refresh(configNames)
+            Notify("Config", "Created: " .. newName)
+        end
+    end,
+})
+
+ConfigSection:NewButton({
+    Title = "Load config",
+    Callback = function()
+        local sel = configDropdown.Get()
+        if sel and sel ~= "---" then
+            local ok = pcall(function() Windows.LoadConfig(sel) end)
+            if ok then
+                Notify("Config", "Loaded: " .. sel)
+                task.defer(function()
+                    task.wait(0.3)
+                    SyncStateFromToggles()
+                end)
+            else
+                Notify("Config", "Gagal load: " .. sel, 4)
+            end
+        end
+    end,
+})
+
+ConfigSection:NewButton({
+    Title = "Overwrite config",
+    Callback = function()
+        local sel = configDropdown.Get()
+        if sel and sel ~= "---" then
+            Windows.SaveConfig(sel)
+            Notify("Config", "Overwritten: " .. sel)
+        end
+    end,
+})
+
+ConfigSection:NewButton({
+    Title = "Delete config",
+    Callback = function()
+        local sel = configDropdown.Get()
+        if sel and sel ~= "---" then
+            pcall(function()
+                delfile(Windows.ConfigFolder .. "/" .. sel .. ".json")
+            end)
+            configNames = RefreshConfigList()
+            configDropdown.Refresh(configNames)
+            Notify("Config", "Deleted: " .. sel)
+        end
+    end,
+})
+
+ConfigSection:NewButton({
+    Title = "Refresh list",
+    Callback = function()
+        configNames = RefreshConfigList()
+        configDropdown.Refresh(configNames)
+        Notify("Config", "Refreshed")
+    end,
+})
+
+local autoloadLabel = ConfigSection:NewLabel(
+    "Current autoload config: " .. (ReadAutoload() ~= "" and ReadAutoload() or "none")
+)
+
+ConfigSection:NewButton({
+    Title = "Set as autoload",
+    Callback = function()
+        local sel = configDropdown.Get()
+        if sel and sel ~= "---" then
+            WriteAutoload(sel)
+            pcall(function() autoloadLabel.Set("Current autoload config: " .. sel) end)
+            Notify("Autoload", "Set: " .. sel)
+        end
+    end,
+})
+
+ConfigSection:NewButton({
+    Title = "Reset autoload",
+    Callback = function()
+        WriteAutoload("")
+        pcall(function() autoloadLabel.Set("Current autoload config: none") end)
+        Notify("Autoload", "Reset")
+    end,
+})
+
+--==================================================
+--= SYNC STATE SETELAH LOAD CONFIG
+--==================================================
+
+function SyncStateFromToggles()
+    local function readVal(ref)
+        if not ref then return nil end
+        if ref.Value ~= nil then return ref.Value end
+        if type(ref.Get) == "function" then
+            local ok, v = pcall(ref.Get)
+            if ok then return v end
+        end
+        return nil
+    end
+
+    local v
+
+    v = readVal(toggleRefs.EnableAutoFarm)
+    if v ~= nil then State.EnableAutoFarm = v end
+
+    v = readVal(toggleRefs.ServerHop)
+    if v ~= nil then
+        State.ServerHop = v
+        if v then task.spawn(ServerHop) end
+    end
+
+    v = readVal(toggleRefs.AutoExecute)
+    if v ~= nil then
+        State.AutoExecute = v
+        if v then QueueAutoExec() end
+    end
+
+    v = readVal(toggleRefs.EnableWebhook)
+    if v ~= nil then State.EnableWebhook = v end
+end
+
+--==================================================
+--= AUTO LOAD SAAT SCRIPT DIEKSEKUSI (termasuk setelah hop)
+--==================================================
+
+task.defer(function()
+    task.wait(1.2)
+    local name = ReadAutoload()
+    if name == "" then
+        if autoloadLabel then pcall(function() autoloadLabel.Set("Current autoload config: none") end) end
+        return
+    end
+
+    local list = Windows.ListConfigs() or {}
+    local found = false
+    for _, c in ipairs(list) do
+        if c == name then found = true; break end
+    end
+
+    if found then
+        local ok = pcall(function() Windows.LoadConfig(name) end)
+        if ok then
+            Notify("Autoload", "Loaded: " .. name)
+            task.defer(function()
+                task.wait(0.3)
+                SyncStateFromToggles()
+            end)
+        else
+            Notify("Autoload", "Gagal load: " .. name, 4)
+        end
+    else
+        Notify("Autoload", "Config tidak ditemukan: " .. name, 4)
+    end
+end)
+
+--==================================================
+--= START MAIN LOOP
+--==================================================
+
+QueueAutoExec()
+task.spawn(function()
+    while not Unloaded do
+        pcall(BeatGame)
+        task.wait(1)
+    end
+end)
