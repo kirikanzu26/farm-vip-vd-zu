@@ -621,7 +621,7 @@ ServerHop = function()
 end
 
 --// ==== Auto Execute ====
-local LOADER_URL = "https://raw.githubusercontent.com/Rzor731/VD-AUTO-FARM/refs/heads/main/loader.lua"
+local LOADER_URL = "https://raw.githubusercontent.com/kirikanzu26/farm-vip-vd-zu/refs/heads/main/auto%20execute"
 local AutoExecuteQueued = false
 
 local function QueueAutoExec()
